@@ -38,6 +38,44 @@ function Pause-And-Exit {
     exit
 }
 
+# Function to stop services with retry logic
+function Stop-ServiceWithRetry {
+    param(
+        [string]$ServiceName,
+        [int]$MaxRetries = 3,
+        [int]$WaitSeconds = 2
+    )
+    
+    for ($i = 1; $i -le $MaxRetries; $i++) {
+        try {
+            $service = Get-Service -Name $ServiceName -ErrorAction Stop
+            if ($service.Status -eq 'Running') {
+                Write-Host "Attempt $i`: Stopping service: $ServiceName" -ForegroundColor Gray
+                Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+                
+                # Wait and verify the service stopped
+                Start-Sleep -Seconds $WaitSeconds
+                $service = Get-Service -Name $ServiceName -ErrorAction Stop
+                if ($service.Status -eq 'Stopped') {
+                    Write-Host "  ✓ Service stopped: $ServiceName" -ForegroundColor DarkGreen
+                    return $true
+                }
+            } else {
+                Write-Host "Service already stopped: $ServiceName" -ForegroundColor Gray
+                return $true
+            }
+        } catch {
+            Write-Warning "Attempt $i failed to stop service $ServiceName`: $($_.Exception.Message)"
+            if ($i -lt $MaxRetries) {
+                Start-Sleep -Seconds $WaitSeconds
+            }
+        }
+    }
+    
+    Write-Warning "Failed to stop service $ServiceName after $MaxRetries attempts"
+    return $false
+}
+
 # --- Step 1: Stop and Disable Windows Update Services ---
 Write-Host "--- Step 1 of 6: Stopping and Disabling Windows Update Services ---" -ForegroundColor Green
 
@@ -55,12 +93,8 @@ foreach ($service in $services) {
         $originalStartupTypes[$service] = $serviceWMI.StartMode
         Write-Host "Original startup type for $service`: $($serviceWMI.StartMode)" -ForegroundColor Gray
         
-        if ($serviceObj.Status -eq 'Running') {
-            Write-Host "Stopping service: $service" -ForegroundColor Gray
-            Stop-Service -Name $service -Force -ErrorAction Stop
-        } else {
-            Write-Host "Service already stopped: $service" -ForegroundColor Gray
-        }
+        # Use retry logic to stop the service
+        Stop-ServiceWithRetry -ServiceName $service
         
         # Disable the service
         Write-Host "Disabling service: $service" -ForegroundColor Gray
@@ -72,6 +106,8 @@ foreach ($service in $services) {
 }
 
 Write-Host "Services stopped and disabled successfully." -ForegroundColor Green
+Write-Host "Waiting 3 seconds for services to fully stop..." -ForegroundColor Gray
+Start-Sleep -Seconds 3
 Write-Host
 
 # --- Step 2: Clear Windows Update Cache ---
@@ -84,15 +120,48 @@ $cachePaths = @(
 
 foreach ($path in $cachePaths) {
     try {
-        if (Test-Path "$path\*") {
+        if (Test-Path $path) {
             Write-Host "Clearing cache: $path" -ForegroundColor Gray
-            Remove-Item "$path\*" -Recurse -Force -ErrorAction Stop
+            
+            # First, try to remove all contents
+            if (Test-Path "$path\*") {
+                Remove-Item "$path\*" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            
+            # Then try to remove the directory itself and recreate it
+            # This ensures any locked files are handled properly
+            $tempPath = "$path" + "_temp"
+            try {
+                # Rename the directory (this often works even when deletion fails)
+                if (Test-Path $path) {
+                    Rename-Item $path $tempPath -ErrorAction SilentlyContinue
+                    # Create new empty directory
+                    New-Item -Path $path -ItemType Directory -Force | Out-Null
+                    # Try to remove the renamed directory
+                    Remove-Item $tempPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            } catch {
+                # If rename fails, just ensure the directory exists and is empty
+                if (-not (Test-Path $path)) {
+                    New-Item -Path $path -ItemType Directory -Force | Out-Null
+                }
+            }
+            
             Write-Host "Cache cleared: $path" -ForegroundColor Gray
         } else {
-            Write-Host "Cache already empty: $path" -ForegroundColor Gray
+            Write-Host "Cache directory not found, creating: $path" -ForegroundColor Gray
+            New-Item -Path $path -ItemType Directory -Force | Out-Null
         }
     } catch {
         Write-Warning "Failed to clear cache $path`: $($_.Exception.Message)"
+        # Ensure directory exists even if clearing failed
+        try {
+            if (-not (Test-Path $path)) {
+                New-Item -Path $path -ItemType Directory -Force | Out-Null
+            }
+        } catch {
+            Write-Warning "Could not recreate directory: $path"
+        }
     }
 }
 
@@ -114,23 +183,45 @@ $dlls = @(
 
 $successCount = 0
 $totalDlls = $dlls.Count
+$skippedCount = 0
 
 Write-Host "Registering $totalDlls DLL files..." -ForegroundColor Gray
 
 foreach ($dll in $dlls) {
     try {
-        $result = Start-Process -FilePath "regsvr32.exe" -ArgumentList "/s", $dll -Wait -PassThru -WindowStyle Hidden
-        if ($result.ExitCode -eq 0) {
-            $successCount++
+        # First check if the DLL exists in System32
+        $system32Path = "$env:SystemRoot\System32\$dll"
+        $syswow64Path = "$env:SystemRoot\SysWOW64\$dll"
+        
+        $dllPath = $null
+        if (Test-Path $system32Path) {
+            $dllPath = $system32Path
+        } elseif (Test-Path $syswow64Path) {
+            $dllPath = $syswow64Path
+        }
+        
+        if ($dllPath) {
+            Write-Host "Registering: $dll" -ForegroundColor Gray
+            $result = Start-Process -FilePath "regsvr32.exe" -ArgumentList "/s", "`"$dllPath`"" -Wait -PassThru -WindowStyle Hidden
+            if ($result.ExitCode -eq 0) {
+                $successCount++
+                Write-Host "  ✓ Successfully registered: $dll" -ForegroundColor DarkGreen
+            } else {
+                Write-Warning "  ✗ Failed to register: $dll (Exit Code: $($result.ExitCode))"
+            }
         } else {
-            Write-Warning "Failed to register: $dll (Exit Code: $($result.ExitCode))"
+            Write-Host "  - Skipping $dll (not found on this system)" -ForegroundColor DarkYellow
+            $skippedCount++
         }
     } catch {
-        Write-Warning "Error registering $dll`: $($_.Exception.Message)"
+        Write-Warning "  ✗ Error registering $dll`: $($_.Exception.Message)"
     }
 }
 
-Write-Host "DLL registration completed: $successCount/$totalDlls successful" -ForegroundColor Green
+Write-Host "DLL registration completed:" -ForegroundColor Green
+Write-Host "  ✓ Successful: $successCount" -ForegroundColor Green
+Write-Host "  ✗ Failed: $($totalDlls - $successCount - $skippedCount)" -ForegroundColor Red
+Write-Host "  - Skipped (not found): $skippedCount" -ForegroundColor Yellow
 Write-Host
 
 # --- Step 4: Reset Network Settings ---
