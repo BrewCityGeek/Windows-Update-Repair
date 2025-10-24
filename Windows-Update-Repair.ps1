@@ -38,29 +38,44 @@ function Pause-And-Exit {
     exit
 }
 
-# --- Step 1: Stop Windows Update Services ---
-Write-Host "--- Step 1 of 5: Stopping Windows Update Services ---" -ForegroundColor Green
+# --- Step 1: Stop and Disable Windows Update Services ---
+Write-Host "--- Step 1 of 6: Stopping and Disabling Windows Update Services ---" -ForegroundColor Green
 
 $services = @("BITS", "wuauserv", "appidsvc", "cryptsvc")
+
+# Store original service startup types for restoration later
+$originalStartupTypes = @{}
+
 foreach ($service in $services) {
     try {
         $serviceObj = Get-Service -Name $service -ErrorAction Stop
+        $serviceWMI = Get-WmiObject -Class Win32_Service -Filter "Name='$service'" -ErrorAction Stop
+        
+        # Store original startup type
+        $originalStartupTypes[$service] = $serviceWMI.StartMode
+        Write-Host "Original startup type for $service`: $($serviceWMI.StartMode)" -ForegroundColor Gray
+        
         if ($serviceObj.Status -eq 'Running') {
             Write-Host "Stopping service: $service" -ForegroundColor Gray
             Stop-Service -Name $service -Force -ErrorAction Stop
         } else {
             Write-Host "Service already stopped: $service" -ForegroundColor Gray
         }
+        
+        # Disable the service
+        Write-Host "Disabling service: $service" -ForegroundColor Gray
+        Set-Service -Name $service -StartupType Disabled -ErrorAction Stop
+        
     } catch {
-        Write-Warning "Failed to stop service $service`: $($_.Exception.Message)"
+        Write-Warning "Failed to stop/disable service $service`: $($_.Exception.Message)"
     }
 }
 
-Write-Host "Services stopped successfully." -ForegroundColor Green
+Write-Host "Services stopped and disabled successfully." -ForegroundColor Green
 Write-Host
 
 # --- Step 2: Clear Windows Update Cache ---
-Write-Host "--- Step 2 of 5: Clearing Windows Update Cache ---" -ForegroundColor Green
+Write-Host "--- Step 2 of 6: Clearing Windows Update Cache ---" -ForegroundColor Green
 
 $cachePaths = @(
     "$env:SystemRoot\SoftwareDistribution",
@@ -85,7 +100,7 @@ Write-Host "Cache clearing completed." -ForegroundColor Green
 Write-Host
 
 # --- Step 3: Re-register Windows Update DLLs ---
-Write-Host "--- Step 3 of 5: Re-registering Windows Update DLLs ---" -ForegroundColor Green
+Write-Host "--- Step 3 of 6: Re-registering Windows Update DLLs ---" -ForegroundColor Green
 
 $dlls = @(
     "atl.dll", "urlmon.dll", "mshtml.dll", "shdocvw.dll", "browseui.dll",
@@ -119,7 +134,7 @@ Write-Host "DLL registration completed: $successCount/$totalDlls successful" -Fo
 Write-Host
 
 # --- Step 4: Reset Network Settings ---
-Write-Host "--- Step 4 of 5: Resetting Network Settings ---" -ForegroundColor Green
+Write-Host "--- Step 4 of 6: Resetting Network Settings ---" -ForegroundColor Green
 
 try {
     Write-Host "Resetting Winsock catalog..." -ForegroundColor Gray
@@ -148,35 +163,50 @@ try {
 Write-Host "Network settings reset completed." -ForegroundColor Green
 Write-Host
 
-# --- Step 5: Start Windows Update Services ---
-Write-Host "--- Step 5 of 5: Starting Windows Update Services ---" -ForegroundColor Green
+# --- Step 5: Re-enable Windows Update Services ---
+Write-Host "--- Step 5 of 6: Re-enabling Windows Update Services ---" -ForegroundColor Green
 
 foreach ($service in $services) {
     try {
-        Write-Host "Starting service: $service" -ForegroundColor Gray
-        Start-Service -Name $service -ErrorAction Stop
+        # Set all services to Automatic startup (reboot will start them)
+        Write-Host "Setting service $service to Automatic startup" -ForegroundColor Gray
+        Set-Service -Name $service -StartupType Automatic -ErrorAction Stop
+        Write-Host "Service $service configured for automatic startup" -ForegroundColor Gray
         
-        # Wait a moment and verify service started
-        Start-Sleep -Seconds 2
-        $serviceObj = Get-Service -Name $service
-        if ($serviceObj.Status -eq 'Running') {
-            Write-Host "Service started successfully: $service" -ForegroundColor Gray
-        } else {
-            Write-Warning "Service may not have started properly: $service (Status: $($serviceObj.Status))"
-        }
     } catch {
-        Write-Warning "Failed to start service $service`: $($_.Exception.Message)"
+        Write-Warning "Failed to configure service $service`: $($_.Exception.Message)"
     }
 }
 
-Write-Host "Service startup completed." -ForegroundColor Green
+Write-Host "Services configured for automatic startup. They will start after reboot." -ForegroundColor Green
 Write-Host
 
-# --- Final Message ---
+# --- Step 6: Reboot System ---
+Write-Host "--- Step 6 of 6: Preparing System Reboot ---" -ForegroundColor Green
+
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host "Windows Update repair process completed!" -ForegroundColor Cyan
-Write-Host "It is recommended to restart your computer now." -ForegroundColor Yellow
-Write-Host "After restart, try running Windows Update again." -ForegroundColor Yellow
+Write-Host "The system will reboot in 30 seconds..." -ForegroundColor Yellow
+Write-Host "After restart, Windows Update should work properly." -ForegroundColor Yellow
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host
-Read-Host "Press ENTER to exit the script."
+
+# Give user a chance to cancel the reboot
+Write-Host "Press Ctrl+C within 30 seconds to cancel the automatic reboot." -ForegroundColor Red
+Write-Host "Otherwise, the system will reboot automatically." -ForegroundColor Yellow
+Write-Host
+
+try {
+    # Countdown timer
+    for ($i = 30; $i -gt 0; $i--) {
+        Write-Host "Rebooting in $i seconds..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 1
+    }
+    
+    Write-Host "Initiating system reboot..." -ForegroundColor Green
+    Restart-Computer -Force
+} catch {
+    Write-Host "Reboot cancelled by user or error occurred." -ForegroundColor Red
+    Write-Host "Please manually restart your computer to complete the repair process." -ForegroundColor Yellow
+    Read-Host "Press ENTER to exit the script"
+}
