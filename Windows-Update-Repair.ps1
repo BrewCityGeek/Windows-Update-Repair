@@ -110,9 +110,63 @@ Write-Host "Waiting 3 seconds for services to fully stop..." -ForegroundColor Gr
 Start-Sleep -Seconds 3
 Write-Host
 
-# --- Step 2: Clear Windows Update Cache ---
-Write-Host "--- Step 2 of 6: Clearing Windows Update Cache ---" -ForegroundColor Green
+# --- Step 2: Delete BITS Queue Manager Files ---
+Write-Host "--- Step 2 of 7: Deleting BITS Queue Manager Files ---" -ForegroundColor Green
 
+$qmgrPaths = @(
+    "$env:ALLUSERSPROFILE\Application Data\Microsoft\Network\Downloader\qmgr*.dat",
+    "$env:ALLUSERSPROFILE\Microsoft\Network\Downloader\qmgr*.dat"
+)
+
+foreach ($qmgrPath in $qmgrPaths) {
+    try {
+        if (Test-Path $qmgrPath) {
+            Write-Host "Deleting BITS queue files: $qmgrPath" -ForegroundColor Gray
+            Remove-Item $qmgrPath -Force -ErrorAction SilentlyContinue
+            Write-Host "  ✓ BITS queue files deleted" -ForegroundColor DarkGreen
+        }
+    } catch {
+        Write-Warning "Failed to delete BITS queue files: $($_.Exception.Message)"
+    }
+}
+
+Write-Host "BITS queue cleanup completed." -ForegroundColor Green
+Write-Host
+
+# --- Step 3: Clear Windows Update Cache ---
+Write-Host "--- Step 3 of 7: Clearing Windows Update Cache ---" -ForegroundColor Green
+
+# First, rename specific subdirectories as per Microsoft documentation
+$specificPaths = @(
+    @{Path = "$env:SystemRoot\SoftwareDistribution\DataStore"; BackupName = "DataStore.bak"},
+    @{Path = "$env:SystemRoot\SoftwareDistribution\Download"; BackupName = "Download.bak"},
+    @{Path = "$env:SystemRoot\System32\catroot2"; BackupName = "catroot2.bak"}
+)
+
+foreach ($item in $specificPaths) {
+    try {
+        if (Test-Path $item.Path) {
+            $parentPath = Split-Path $item.Path -Parent
+            $backupPath = Join-Path $parentPath $item.BackupName
+            
+            # Remove old backup if it exists
+            if (Test-Path $backupPath) {
+                Write-Host "Removing old backup: $backupPath" -ForegroundColor Gray
+                Remove-Item $backupPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            
+            Write-Host "Renaming: $($item.Path) to $($item.BackupName)" -ForegroundColor Gray
+            Rename-Item $item.Path $backupPath -ErrorAction Stop
+            Write-Host "  ✓ Successfully renamed to $($item.BackupName)" -ForegroundColor DarkGreen
+        } else {
+            Write-Host "Path not found, skipping: $($item.Path)" -ForegroundColor Gray
+        }
+    } catch {
+        Write-Warning "Failed to rename $($item.Path): $($_.Exception.Message)"
+    }
+}
+
+# Ensure the main directories exist
 $cachePaths = @(
     "$env:SystemRoot\SoftwareDistribution",
     "$env:SystemRoot\System32\catroot2"
@@ -120,56 +174,51 @@ $cachePaths = @(
 
 foreach ($path in $cachePaths) {
     try {
-        if (Test-Path $path) {
-            Write-Host "Clearing cache: $path" -ForegroundColor Gray
-            
-            # First, try to remove all contents
-            if (Test-Path "$path\*") {
-                Remove-Item "$path\*" -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            
-            # Then try to remove the directory itself and recreate it
-            # This ensures any locked files are handled properly
-            $tempPath = "$path" + "_temp"
-            try {
-                # Rename the directory (this often works even when deletion fails)
-                if (Test-Path $path) {
-                    Rename-Item $path $tempPath -ErrorAction SilentlyContinue
-                    # Create new empty directory
-                    New-Item -Path $path -ItemType Directory -Force | Out-Null
-                    # Try to remove the renamed directory
-                    Remove-Item $tempPath -Recurse -Force -ErrorAction SilentlyContinue
-                }
-            } catch {
-                # If rename fails, just ensure the directory exists and is empty
-                if (-not (Test-Path $path)) {
-                    New-Item -Path $path -ItemType Directory -Force | Out-Null
-                }
-            }
-            
-            Write-Host "Cache cleared: $path" -ForegroundColor Gray
-        } else {
-            Write-Host "Cache directory not found, creating: $path" -ForegroundColor Gray
+        if (-not (Test-Path $path)) {
+            Write-Host "Creating directory: $path" -ForegroundColor Gray
             New-Item -Path $path -ItemType Directory -Force | Out-Null
+            Write-Host "  ✓ Directory created" -ForegroundColor DarkGreen
         }
     } catch {
-        Write-Warning "Failed to clear cache $path`: $($_.Exception.Message)"
-        # Ensure directory exists even if clearing failed
-        try {
-            if (-not (Test-Path $path)) {
-                New-Item -Path $path -ItemType Directory -Force | Out-Null
-            }
-        } catch {
-            Write-Warning "Could not recreate directory: $path"
-        }
+        Write-Warning "Failed to create directory $path`: $($_.Exception.Message)"
     }
 }
 
 Write-Host "Cache clearing completed." -ForegroundColor Green
 Write-Host
 
-# --- Step 3: Re-register Windows Update DLLs ---
-Write-Host "--- Step 3 of 6: Re-registering Windows Update DLLs ---" -ForegroundColor Green
+# --- Step 4: Reset Service Security Descriptors ---
+Write-Host "--- Step 4 of 7: Resetting Service Security Descriptors ---" -ForegroundColor Green
+
+try {
+    Write-Host "Resetting BITS service security descriptor..." -ForegroundColor Gray
+    $bitsResult = Start-Process -FilePath "sc.exe" -ArgumentList "sdset", "bits", "D:(A;CI;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)" -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+    if ($bitsResult.ExitCode -eq 0) {
+        Write-Host "  ✓ BITS security descriptor reset successful" -ForegroundColor DarkGreen
+    } else {
+        Write-Warning "BITS security descriptor reset failed with exit code $($bitsResult.ExitCode)"
+    }
+} catch {
+    Write-Warning "Error resetting BITS security descriptor: $($_.Exception.Message)"
+}
+
+try {
+    Write-Host "Resetting Windows Update service security descriptor..." -ForegroundColor Gray
+    $wuResult = Start-Process -FilePath "sc.exe" -ArgumentList "sdset", "wuauserv", "D:(A;;CCLCSWRPLORC;;;AU)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)" -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+    if ($wuResult.ExitCode -eq 0) {
+        Write-Host "  ✓ Windows Update security descriptor reset successful" -ForegroundColor DarkGreen
+    } else {
+        Write-Warning "Windows Update security descriptor reset failed with exit code $($wuResult.ExitCode)"
+    }
+} catch {
+    Write-Warning "Error resetting Windows Update security descriptor: $($_.Exception.Message)"
+}
+
+Write-Host "Security descriptor reset completed." -ForegroundColor Green
+Write-Host
+
+# --- Step 5: Re-register Windows Update DLLs ---
+Write-Host "--- Step 5 of 7: Re-registering Windows Update DLLs ---" -ForegroundColor Green
 
 $dlls = @(
     "atl.dll", "urlmon.dll", "mshtml.dll", "shdocvw.dll", "browseui.dll",
@@ -224,8 +273,8 @@ Write-Host "  ✗ Failed: $($totalDlls - $successCount - $skippedCount)" -Foregr
 Write-Host "  - Skipped (not found): $skippedCount" -ForegroundColor Yellow
 Write-Host
 
-# --- Step 4: Reset Network Settings ---
-Write-Host "--- Step 4 of 6: Resetting Network Settings ---" -ForegroundColor Green
+# --- Step 6: Reset Network Settings ---
+Write-Host "--- Step 6 of 7: Resetting Network Settings ---" -ForegroundColor Green
 
 try {
     Write-Host "Resetting Winsock catalog..." -ForegroundColor Gray
@@ -254,26 +303,56 @@ try {
 Write-Host "Network settings reset completed." -ForegroundColor Green
 Write-Host
 
-# --- Step 5: Re-enable Windows Update Services ---
-Write-Host "--- Step 5 of 6: Re-enabling Windows Update Services ---" -ForegroundColor Green
+# --- Step 7: Re-enable and Start Windows Update Services ---
+Write-Host "--- Step 7 of 7: Re-enabling and Starting Windows Update Services ---" -ForegroundColor Green
 
 foreach ($service in $services) {
     try {
-        # Set all services to Automatic startup (reboot will start them)
+        # Set all services to Automatic startup
         Write-Host "Setting service $service to Automatic startup" -ForegroundColor Gray
         Set-Service -Name $service -StartupType Automatic -ErrorAction Stop
-        Write-Host "Service $service configured for automatic startup" -ForegroundColor Gray
+        
+        # Try to start the service
+        Write-Host "Starting service: $service" -ForegroundColor Gray
+        Start-Service -Name $service -ErrorAction Stop
+        
+        # Verify the service started
+        $serviceObj = Get-Service -Name $service -ErrorAction Stop
+        if ($serviceObj.Status -eq 'Running') {
+            Write-Host "  ✓ Service started successfully: $service" -ForegroundColor DarkGreen
+        } else {
+            Write-Warning "Service $service is not running (Status: $($serviceObj.Status))"
+        }
         
     } catch {
-        Write-Warning "Failed to configure service $service`: $($_.Exception.Message)"
+        Write-Warning "Failed to start service $service`: $($_.Exception.Message)"
+        Write-Host "  Service will start automatically after reboot" -ForegroundColor Yellow
     }
 }
 
-Write-Host "Services configured for automatic startup. They will start after reboot." -ForegroundColor Green
+Write-Host "Services configured and started." -ForegroundColor Green
 Write-Host
 
-# --- Step 6: Reboot System ---
-Write-Host "--- Step 6 of 6: Preparing System Reboot ---" -ForegroundColor Green
+# --- Step 8: Reset BITS Queue (Windows 10/11) ---
+Write-Host "--- Additional Step: Resetting BITS Queue ---" -ForegroundColor Green
+
+try {
+    Write-Host "Running BITS admin reset for all users..." -ForegroundColor Gray
+    $bitsAdminResult = Start-Process -FilePath "bitsadmin.exe" -ArgumentList "/reset", "/allusers" -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+    if ($bitsAdminResult.ExitCode -eq 0) {
+        Write-Host "  ✓ BITS queue reset successful" -ForegroundColor DarkGreen
+    } else {
+        Write-Warning "BITS queue reset completed with exit code $($bitsAdminResult.ExitCode)"
+    }
+} catch {
+    Write-Warning "Error resetting BITS queue: $($_.Exception.Message)"
+}
+
+Write-Host "BITS queue reset completed." -ForegroundColor Green
+Write-Host
+
+# --- Final Step: Reboot System ---
+Write-Host "--- Final Step: Preparing System Reboot ---" -ForegroundColor Green
 
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host "Windows Update repair process completed!" -ForegroundColor Cyan
