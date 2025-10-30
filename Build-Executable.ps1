@@ -14,9 +14,15 @@ $scriptPath = Join-Path -Path $PSScriptRoot -ChildPath "Windows-Update-Repair.ps
 $exePath = Join-Path -Path $PSScriptRoot -ChildPath "Windows Update Repair.exe"
 $iconPath = Join-Path -Path $PSScriptRoot -ChildPath "icon.ico"  # Optional: Add your own icon
 
+# Prompt for version or use date-based default
+$defaultVersion = Get-Date -Format "yy.MM.dd.1"
+$userVersion = Read-Host "Enter version number (press Enter for default: $defaultVersion)"
+$version = if ([string]::IsNullOrWhiteSpace($userVersion)) { $defaultVersion } else { $userVersion }
+
 Write-Host "Building executable..." -ForegroundColor Cyan
 Write-Host "Source: $scriptPath" -ForegroundColor Gray
 Write-Host "Output: $exePath" -ForegroundColor Gray
+Write-Host "Version: $version" -ForegroundColor Gray
 
 # Convert to EXE with options
 $params = @{
@@ -28,6 +34,7 @@ $params = @{
     RequireAdmin = $true  # No admin rights needed for AD queries
     x64 = $true  # Build for 64-bit
     Verbose = $true
+    Version = $version
 }
 
 # Add icon if it exists
@@ -57,3 +64,4 @@ try {
     Write-Host "`nError during build:" -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Red
 }
+
